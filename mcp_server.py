@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 from dotenv import load_dotenv
@@ -69,6 +70,88 @@ async def verify_token(authorization: str = Header(None)):
         raise HTTPException(status_code=401, detail="Invalid token")
     
     return token
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "message": "Server is running"}
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "timestamp": str(datetime.datetime.now())}
+
+@app.get("/mcp")
+async def mcp_info():
+    return {
+        "status": "ok",
+        "message": "This is an MCP (Model Context Protocol) server endpoint. It accepts POST requests with JSON-RPC 2.0 formatted messages.",
+        "supported_methods": ["initialize", "execute"],
+        "available_tools": ["resume", "fetch_webpage"],
+        "usage": "Use /mcp connect http://localhost:8085/mcp YOUR_TOKEN in your MCP client"
+    }
+
+@app.post("/mcp")
+async def handle_mcp_request(request: Request, token: str = Depends(verify_token)):
+    try:
+        # Parse the raw request body as JSON
+        body = await request.json()
+        message = MCPMessage(**body)
+
+        if message.method == "initialize":
+            return MCPMessage(
+                jsonrpc="2.0",
+                id=message.id,
+                result={
+                    "capabilities": {
+                        "execute": True,
+                        "tokenize": False,
+                        "chat": False,
+                        "embeddings": False,
+                        "tools": ["resume", "fetch_webpage"]
+                    }
+                }
+            )
+        elif message.method == "execute":
+            if not message.params or "tool" not in message.params:
+                raise ValueError("Tool parameter is required")
+            
+            tool = message.params["tool"]
+            arguments = message.params.get("arguments", {})
+            
+            if tool == "resume":
+                content = ResumeProcessor.get_resume_content()
+                return MCPMessage(
+                    jsonrpc="2.0",
+                    id=message.id,
+                    result={"content": content}
+                )
+            elif tool == "fetch_webpage":
+                if "url" not in arguments:
+                    raise ValueError("URL parameter is required")
+                
+                content, content_type = await WebFetcher.fetch_url(arguments["url"])
+                return MCPMessage(
+                    jsonrpc="2.0",
+                    id=message.id,
+                    result={
+                        "content": content,
+                        "content_type": content_type
+                    }
+                )
+            else:
+                raise ValueError(f"Unknown tool: {tool}")
+        else:
+            raise ValueError(f"Unsupported method: {message.method}")
+
+    except Exception as e:
+        logger.error(f"Error processing MCP request: {e}")
+        return MCPMessage(
+            jsonrpc="2.0",
+            id=getattr(message, 'id', None),
+            error={
+                "code": -32000,
+                "message": str(e)
+            }
+        ).dict()
 
 class ResumeProcessor:
     """Handle resume file processing and conversion to markdown."""
@@ -198,44 +281,29 @@ class WebFetcher:
             try:
                 response = await client.get(
                     url,
-                    follow_redirects=True,
                     headers={"User-Agent": cls.USER_AGENT},
-                    timeout=30,
+                    follow_redirects=True
                 )
-            except httpx.HTTPError as e:
-                raise Exception(f"Failed to fetch {url}: {e}")
-
-        if response.status_code >= 400:
-            raise Exception(f"Failed to fetch {url} - status code {response.status_code}")
-
-        page_raw = response.text
-        content_type = response.headers.get("content-type", "")
-        is_page_html = (
-            "<html" in page_raw[:100] or "text/html" in content_type or not content_type
-        )
-
-        if is_page_html and not force_raw:
-            return cls.extract_content_from_html(page_raw), ""
-
-        return (
-            page_raw,
-            f"Content type {content_type} cannot be simplified to markdown, but here is the raw content:\n",
-        )
-
-    @staticmethod
-    def extract_content_from_html(html: str) -> str:
-        """Extract and convert HTML content to Markdown format."""
-        ret = readabilipy.simple_json.simple_json_from_html_string(
-            html, use_readability=True
-        )
-        if not ret["content"]:
-            return "<e>Page failed to be simplified from HTML</e>"
-
-        content = markdownify.markdownify(
-            ret["content"],
-            heading_style=markdownify.ATX,
-        )
-        return content
+                response.raise_for_status()
+                
+                content_type = response.headers.get("content-type", "").lower()
+                
+                if "text/html" in content_type and not force_raw:
+                    # Use readability to extract main content
+                    article = readabilipy.simple_json_from_html_string(response.text)
+                    if article and article.get("content"):
+                        # Convert HTML to markdown
+                        markdown = markdownify.markdownify(article["content"], heading_style="ATX")
+                        title = article.get("title", "")
+                        if title:
+                            markdown = f"# {title}\n\n{markdown}"
+                        return markdown, "text/markdown"
+                    
+                return response.text, content_type
+                
+            except Exception as e:
+                logger.error(f"Error fetching URL {url}: {e}")
+                raise HTTPException(status_code=502, detail=f"Failed to fetch URL: {str(e)}")
 
 # MCP Tool implementations
 class MCPTools:
@@ -431,6 +499,71 @@ async def mcp_handler(request: Request, token: str = Depends(verify_token)):
             id=getattr(message, 'id', None),
             error={
                 "code": -32603,
+                "message": str(e)
+            }
+        )
+
+# MCP endpoint
+@app.post("/mcp")
+async def handle_mcp_request(message: MCPMessage, token: str = Depends(verify_token)):
+    try:
+        if message.method == "initialize":
+            return MCPMessage(
+                jsonrpc="2.0",
+                id=message.id,
+                result={
+                    "capabilities": {
+                        "execute": True,
+                        "tokenize": False,
+                        "chat": False,
+                        "embeddings": False,
+                        "tools": ["resume", "fetch_webpage"]
+                    }
+                }
+            )
+        
+        elif message.method == "execute":
+            if not message.params or "tool" not in message.params:
+                raise ValueError("Tool parameter is required")
+            
+            tool = message.params["tool"]
+            arguments = message.params.get("arguments", {})
+            
+            if tool == "resume":
+                content = ResumeProcessor.get_resume_content()
+                return MCPMessage(
+                    jsonrpc="2.0",
+                    id=message.id,
+                    result={"content": content}
+                )
+            
+            elif tool == "fetch_webpage":
+                if "url" not in arguments:
+                    raise ValueError("URL parameter is required")
+                
+                content, content_type = await WebFetcher.fetch_url(arguments["url"])
+                return MCPMessage(
+                    jsonrpc="2.0",
+                    id=message.id,
+                    result={
+                        "content": content,
+                        "content_type": content_type
+                    }
+                )
+            
+            else:
+                raise ValueError(f"Unknown tool: {tool}")
+        
+        else:
+            raise ValueError(f"Unsupported method: {message.method}")
+            
+    except Exception as e:
+        logger.error(f"Error processing MCP request: {e}")
+        return MCPMessage(
+            jsonrpc="2.0",
+            id=message.id,
+            error={
+                "code": -32000,
                 "message": str(e)
             }
         )
