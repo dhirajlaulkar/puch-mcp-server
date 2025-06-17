@@ -17,8 +17,8 @@ import httpx
 import uvicorn
 
 # REPLACE THESE WITH YOUR ACTUAL VALUES
-TOKEN = "1d1bd2ed584e"  # Replace with your actual application key
-MY_NUMBER = "917620957998"  # Replace with your phone number (e.g., 919876543210)
+TOKEN = ENV_TOKEN  # Replace with your actual application key
+MY_NUMBER = ENV_MY_NUMBER  # Replace with your phone number (e.g., 919876543210)
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
