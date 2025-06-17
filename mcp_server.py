@@ -4,6 +4,10 @@ import logging
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 import markdownify
 import readabilipy
@@ -16,9 +20,12 @@ import docx
 import httpx
 import uvicorn
 
-# REPLACE THESE WITH YOUR ACTUAL VALUES
-TOKEN = ENV_TOKEN  # Replace with your actual application key
-MY_NUMBER = ENV_MY_NUMBER  # Replace with your phone number (e.g., 919876543210)
+# Get environment variables
+TOKEN = os.getenv('TOKEN')
+MY_NUMBER = os.getenv('MY_NUMBER')
+
+if not TOKEN or not MY_NUMBER:
+    raise ValueError("Please ensure TOKEN and MY_NUMBER are set in your .env file")
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
