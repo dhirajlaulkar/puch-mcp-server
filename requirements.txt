@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+mcp
+markdownify
+readabilipy
+httpx
+pydantic
+PyPDF2
+python-docx
