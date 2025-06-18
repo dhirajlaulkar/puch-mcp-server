@@ -101,12 +101,25 @@ async def handle_mcp_request(request: Request, token: str = Depends(verify_token
                 jsonrpc="2.0",
                 id=message.id,
                 result={
+                    "protocolVersion": "0.1",
+                    "serverInfo": {
+                        "name": "Puch MCP Server",
+                        "version": "1.0.0",
+                        "vendor": "Custom"
+                    },
                     "capabilities": {
                         "execute": True,
                         "tokenize": False,
                         "chat": False,
                         "embeddings": False,
-                        "tools": ["resume", "fetch_webpage"]
+                        "tools": {
+                            "resume": {
+                                "description": "Reads and processes resume files in various formats"
+                            },
+                            "fetch_webpage": {
+                                "description": "Fetches and processes web content"
+                            }
+                        }
                     }
                 }
             )
@@ -512,12 +525,25 @@ async def handle_mcp_request(message: MCPMessage, token: str = Depends(verify_to
                 jsonrpc="2.0",
                 id=message.id,
                 result={
+                    "protocolVersion": "0.1",
+                    "serverInfo": {
+                        "name": "Puch MCP Server",
+                        "version": "1.0.0",
+                        "vendor": "Custom"
+                    },
                     "capabilities": {
                         "execute": True,
                         "tokenize": False,
                         "chat": False,
                         "embeddings": False,
-                        "tools": ["resume", "fetch_webpage"]
+                        "tools": {
+                            "resume": {
+                                "description": "Reads and processes resume files in various formats"
+                            },
+                            "fetch_webpage": {
+                                "description": "Fetches and processes web content"
+                            }
+                        }
                     }
                 }
             )
