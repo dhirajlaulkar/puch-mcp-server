@@ -1,622 +1,277 @@
-import asyncio
-import json
-import logging
-import os
-import datetime
+from typing import Annotated
+from fastmcp import FastMCP
+from fastmcp.server.auth.providers.bearer import BearerAuthProvider, RSAKeyPair
+import markdownify
+from mcp import ErrorData, McpError
+from mcp.server.auth.provider import AccessToken
+from mcp.types import INTERNAL_ERROR, INVALID_PARAMS, TextContent
+from pydantic import BaseModel, AnyUrl, Field
+import readabilipy
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+import asyncio
+import os
+
+# Additional imports for enhanced resume tool
+import PyPDF2
+from docx import Document
+
+# Load configuration from environment variables
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
-load_dotenv()
+load_dotenv()  # Load environment variables from .env file
 
-import markdownify
-import readabilipy
-from fastapi import FastAPI, HTTPException, Depends, Header, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-import PyPDF2
-import docx
-import httpx
-import uvicorn
+TOKEN = os.getenv("TOKEN")  # Get API token from environment variables
+MY_NUMBER = os.getenv("MY_NUMBER")  # Get phone number from environment variables (format: country_code + number)
 
-# Get environment variables
-TOKEN = os.getenv('TOKEN')
-MY_NUMBER = os.getenv('MY_NUMBER')
+class RichToolDescription(BaseModel):
+    description: str
+    use_when: str
+    side_effects: str | None
 
-if not TOKEN or not MY_NUMBER:
-    raise ValueError("Please ensure TOKEN and MY_NUMBER are set in your .env file")
+class SimpleBearerAuthProvider(BearerAuthProvider):
+    """
+    A simple BearerAuthProvider that does not require any specific configuration.
+    It allows any valid bearer token to access the MCP server.
+    """
+    def __init__(self, token: str):
+        k = RSAKeyPair.generate()
+        super().__init__(
+            public_key=k.public_key, jwks_uri=None, issuer=None, audience=None
+        )
+        self.token = token
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# FastAPI app
-app = FastAPI(title="Puch MCP Server", version="1.0.0")
-
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Pydantic models
-class MCPMessage(BaseModel):
-    jsonrpc: str = "2.0"
-    id: Optional[Union[str, int]] = None
-    method: Optional[str] = None
-    params: Optional[Dict[str, Any]] = None
-    result: Optional[Any] = None
-    error: Optional[Dict[str, Any]] = None
-
-class ToolCall(BaseModel):
-    name: str
-    arguments: Dict[str, Any]
-
-# Authentication
-async def verify_token(authorization: str = Header(None)):
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header required")
-    
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Invalid authorization format")
-    
-    token = authorization.split(" ")[1]
-    if token != TOKEN:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    
-    return token
-
-@app.get("/")
-async def root():
-    return {"status": "ok", "message": "Server is running"}
-
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy", "timestamp": str(datetime.datetime.now())}
-
-@app.get("/mcp")
-async def mcp_info():
-    return {
-        "status": "ok",
-        "message": "This is an MCP (Model Context Protocol) server endpoint. It accepts POST requests with JSON-RPC 2.0 formatted messages.",
-        "supported_methods": ["initialize", "execute"],
-        "available_tools": ["resume", "fetch_webpage"],
-        "usage": "Use /mcp connect http://localhost:8085/mcp YOUR_TOKEN in your MCP client"
-    }
-
-@app.post("/mcp")
-async def handle_mcp_request(request: Request, token: str = Depends(verify_token)):
-    try:
-        # Parse the raw request body as JSON
-        body = await request.json()
-        message = MCPMessage(**body)
-
-        if message.method == "initialize":
-            return MCPMessage(
-                jsonrpc="2.0",
-                id=message.id,
-                result={
-                    "protocolVersion": "0.1",
-                    "serverInfo": {
-                        "name": "Puch MCP Server",
-                        "version": "1.0.0",
-                        "vendor": "Custom"
-                    },
-                    "capabilities": {
-                        "execute": True,
-                        "tokenize": False,
-                        "chat": False,
-                        "embeddings": False,
-                        "tools": {
-                            "resume": {
-                                "description": "Reads and processes resume files in various formats"
-                            },
-                            "fetch_webpage": {
-                                "description": "Fetches and processes web content"
-                            }
-                        }
-                    }
-                }
+    async def load_access_token(self, token: str) -> AccessToken | None:
+        if token == self.token:
+            return AccessToken(
+                token=token,
+                client_id="unknown",
+                scopes=[],
+                expires_at=None,  # No expiration for simplicity
             )
-        elif message.method == "execute":
-            if not message.params or "tool" not in message.params:
-                raise ValueError("Tool parameter is required")
-            
-            tool = message.params["tool"]
-            arguments = message.params.get("arguments", {})
-            
-            if tool == "resume":
-                content = ResumeProcessor.get_resume_content()
-                return MCPMessage(
-                    jsonrpc="2.0",
-                    id=message.id,
-                    result={"content": content}
-                )
-            elif tool == "fetch_webpage":
-                if "url" not in arguments:
-                    raise ValueError("URL parameter is required")
-                
-                content, content_type = await WebFetcher.fetch_url(arguments["url"])
-                return MCPMessage(
-                    jsonrpc="2.0",
-                    id=message.id,
-                    result={
-                        "content": content,
-                        "content_type": content_type
-                    }
-                )
-            else:
-                raise ValueError(f"Unknown tool: {tool}")
-        else:
-            raise ValueError(f"Unsupported method: {message.method}")
+        return None
 
-    except Exception as e:
-        logger.error(f"Error processing MCP request: {e}")
-        return MCPMessage(
-            jsonrpc="2.0",
-            id=getattr(message, 'id', None),
-            error={
-                "code": -32000,
-                "message": str(e)
-            }
-        ).dict()
-
-class ResumeProcessor:
-    """Handle resume file processing and conversion to markdown."""
-    
-    @staticmethod
-    def read_pdf(file_path: str) -> str:
-        """Extract text from PDF file."""
-        try:
-            with open(file_path, 'rb') as file:
-                pdf_reader = PyPDF2.PdfReader(file)
-                text = ""
-                for page in pdf_reader.pages:
-                    text += page.extract_text() + "\n"
-            return text
-        except Exception as e:
-            raise Exception(f"Failed to read PDF: {e}")
-
-    @staticmethod
-    def read_docx(file_path: str) -> str:
-        """Extract text from DOCX file."""
-        try:
-            doc = docx.Document(file_path)
-            text = ""
-            for paragraph in doc.paragraphs:
-                text += paragraph.text + "\n"
-            return text
-        except Exception as e:
-            raise Exception(f"Failed to read DOCX: {e}")
-
-    @staticmethod
-    def read_txt(file_path: str) -> str:
-        """Read plain text file."""
-        try:
-            with open(file_path, 'r', encoding='utf-8') as file:
-                return file.read()
-        except Exception as e:
-            raise Exception(f"Failed to read text file: {e}")
-
-    @staticmethod
-    def convert_to_markdown(text: str) -> str:
-        """Convert text to markdown format with basic formatting."""
-        lines = text.split('\n')
-        markdown_lines = []
-        
-        for line in lines:
-            line = line.strip()
-            if not line:
-                markdown_lines.append("")
-                continue
-                
-            # Simple heuristics for markdown conversion
-            if line.isupper() and len(line) > 3:
-                # Likely a section header
-                markdown_lines.append(f"## {line.title()}")
-            elif line.endswith(':') and len(line.split()) <= 5:
-                # Likely a subsection
-                markdown_lines.append(f"### {line}")
-            else:
-                markdown_lines.append(line)
-        
-        return '\n'.join(markdown_lines)
-
-    @classmethod
-    def get_resume_content(cls) -> str:
-        """Find and process resume file, return as markdown."""
-        try:
-            # Look for resume files in common locations and formats
-            possible_paths = [
-                "resume.pdf",
-                "resume.docx", 
-                "resume.txt",
-                "cv.pdf",
-                "cv.docx",
-                "cv.txt",
-                "./resume.pdf",
-                "./resume.docx",
-                "./resume.txt"
-            ]
-            
-            resume_path = None
-            for path in possible_paths:
-                if os.path.exists(path):
-                    resume_path = path
-                    break
-            
-            if not resume_path:
-                return """# Resume Not Found
-
-Please place your resume file in the server directory with one of these names:
-- resume.pdf
-- resume.docx  
-- resume.txt
-- cv.pdf
-- cv.docx
-- cv.txt
-"""
-            
-            # Read the file based on its extension
-            file_extension = Path(resume_path).suffix.lower()
-            
-            if file_extension == '.pdf':
-                text_content = cls.read_pdf(resume_path)
-            elif file_extension == '.docx':
-                text_content = cls.read_docx(resume_path)
-            elif file_extension == '.txt':
-                text_content = cls.read_txt(resume_path)
-            else:
-                raise Exception(f"Unsupported file format: {file_extension}")
-            
-            # Convert to markdown
-            markdown_content = cls.convert_to_markdown(text_content)
-            
-            return markdown_content
-            
-        except Exception as e:
-            return f"# Error Processing Resume\n\nFailed to process resume: {str(e)}"
-
-class WebFetcher:
-    """Handle web content fetching and processing."""
-    
+class Fetch:
+    IGNORE_ROBOTS_TXT = True
     USER_AGENT = "Puch/1.0 (Autonomous)"
-    
+
     @classmethod
-    async def fetch_url(cls, url: str, force_raw: bool = False) -> tuple[str, str]:
-        """Fetch URL and return content ready for LLM."""
+    async def fetch_url(
+        cls,
+        url: str,
+        user_agent: str,
+        force_raw: bool = False,
+    ) -> tuple[str, str]:
+        """
+        Fetch the URL and return the content in a form ready for the LLM, as well as a prefix string with status information.
+        """
+        import httpx
+        
         async with httpx.AsyncClient() as client:
             try:
                 response = await client.get(
                     url,
-                    headers={"User-Agent": cls.USER_AGENT},
-                    follow_redirects=True
+                    follow_redirects=True,
+                    headers={"User-Agent": user_agent},
+                    timeout=30,
                 )
-                response.raise_for_status()
-                
-                content_type = response.headers.get("content-type", "").lower()
-                
-                if "text/html" in content_type and not force_raw:
-                    # Use readability to extract main content
-                    article = readabilipy.simple_json_from_html_string(response.text)
-                    if article and article.get("content"):
-                        # Convert HTML to markdown
-                        markdown = markdownify.markdownify(article["content"], heading_style="ATX")
-                        title = article.get("title", "")
-                        if title:
-                            markdown = f"# {title}\n\n{markdown}"
-                        return markdown, "text/markdown"
-                    
-                return response.text, content_type
-                
             except Exception as e:
-                logger.error(f"Error fetching URL {url}: {e}")
-                raise HTTPException(status_code=502, detail=f"Failed to fetch URL: {str(e)}")
+                raise McpError(
+                    ErrorData(
+                        code=INTERNAL_ERROR, message=f"Failed to fetch {url}: {e!r}"
+                    )
+                )
 
-# MCP Tool implementations
-class MCPTools:
+        if response.status_code >= 400:
+            raise McpError(
+                ErrorData(
+                    code=INTERNAL_ERROR,
+                    message=f"Failed to fetch {url} - status code {response.status_code}",
+                )
+            )
+
+        page_raw = response.text
+        content_type = response.headers.get("content-type", "")
+        is_page_html = (
+            "<html" in page_raw[:100] or "text/html" in content_type or not content_type
+        )
+
+        if is_page_html and not force_raw:
+            return cls.extract_content_from_html(page_raw), ""
+
+        return (
+            page_raw,
+            f"Content type {content_type} cannot be simplified to markdown, but here is the raw content:\n",
+        )
+
     @staticmethod
-    async def list_tools():
-        """Return available tools."""
-        return {
-            "tools": [
-                {
-                    "name": "resume",
-                    "description": "Return your resume in markdown format. Use when asked for resume or CV.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {},
-                        "required": []
-                    }
-                },
-                {
-                    "name": "validate",
-                    "description": "Validate phone number for Puch AI. This tool must be present.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {},
-                        "required": []
-                    }
-                },
-                {
-                    "name": "fetch",
-                    "description": "Fetch a URL and return its content in markdown format.",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "url": {
-                                "type": "string",
-                                "description": "URL to fetch"
-                            },
-                            "max_length": {
-                                "type": "integer",
-                                "description": "Maximum number of characters to return",
-                                "default": 5000,
-                                "minimum": 1,
-                                "maximum": 1000000
-                            },
-                            "start_index": {
-                                "type": "integer",
-                                "description": "Starting character index for truncated content",
-                                "default": 0,
-                                "minimum": 0
-                            },
-                            "raw": {
-                                "type": "boolean",
-                                "description": "Return raw HTML instead of simplified markdown",
-                                "default": False
-                            }
-                        },
-                        "required": ["url"]
-                    }
-                }
-            ]
-        }
-    
-    @staticmethod
-    async def call_tool(name: str, arguments: Dict[str, Any]):
-        """Handle tool calls."""
+    def extract_content_from_html(html: str) -> str:
+        """Extract and convert HTML content to Markdown format."""
         try:
-            if name == "resume":
-                content = ResumeProcessor.get_resume_content()
-                return {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": content
-                        }
-                    ]
-                }
+            ret = readabilipy.simple_json.simple_json_from_html_string(
+                html, use_readability=True
+            )
+            if not ret["content"]:
+                return "<e>Page failed to be simplified from HTML</e>"
             
-            elif name == "validate":
-                return {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": MY_NUMBER
-                        }
-                    ]
-                }
-            
-            elif name == "fetch":
-                url = arguments.get("url")
-                if not url:
-                    raise ValueError("URL is required")
-                
-                max_length = arguments.get("max_length", 5000)
-                start_index = arguments.get("start_index", 0)
-                raw = arguments.get("raw", False)
-                
-                content, prefix = await WebFetcher.fetch_url(url, force_raw=raw)
-                original_length = len(content)
-                
-                if start_index >= original_length:
-                    content = "<e>No more content available.</e>"
-                else:
-                    truncated_content = content[start_index:start_index + max_length]
-                    if not truncated_content:
-                        content = "<e>No more content available.</e>"
-                    else:
-                        content = truncated_content
-                        
-                    actual_content_length = len(truncated_content)
-                    remaining_content = original_length - (start_index + actual_content_length)
-                    
-                    if actual_content_length == max_length and remaining_content > 0:
-                        next_start = start_index + actual_content_length
-                        content += f"\n\n<e>Content truncated. Call the fetch tool with a start_index of {next_start} to get more content.</e>"
-                
-                return {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": f"{prefix}Contents of {url}:\n{content}"
-                        }
-                    ]
-                }
-            
-            else:
-                raise ValueError(f"Unknown tool: {name}")
-                
+            content = markdownify.markdownify(
+                ret["content"],
+                heading_style=markdownify.ATX,
+            )
+            return content
         except Exception as e:
-            logger.error(f"Error in tool {name}: {e}")
-            raise HTTPException(status_code=500, detail=f"Tool error: {str(e)}")
+            return f"<e>Error processing HTML: {str(e)}</e>"
 
-# Routes
-@app.get("/")
-async def root():
-    return {"message": "Puch MCP Server is running", "version": "1.0.0"}
+# Initialize the MCP server
+mcp = FastMCP(
+    "My MCP Server",
+    auth=SimpleBearerAuthProvider(TOKEN),
+)
 
-@app.get("/health")
-async def health():
-    return {"status": "healthy"}
+ResumeToolDescription = RichToolDescription(
+    description="Serve your resume in plain markdown.",
+    use_when="Puch (or anyone) asks for your resume; this must return raw markdown, no extra formatting.",
+    side_effects=None,
+)
 
-@app.post("/mcp")
-async def mcp_handler(request: Request, token: str = Depends(verify_token)):
-    """Main MCP endpoint handler."""
+# ENHANCED RESUME TOOL - Supports .txt, .md, .pdf, and .docx files
+@mcp.tool(description=ResumeToolDescription.model_dump_json())
+async def resume() -> str:
+    """
+    Return your resume exactly as markdown text.
+    Supports .txt, .md, .pdf, and .docx files.
+    """
     try:
-        body = await request.json()
-        message = MCPMessage(**body)
+        # Look for resume files in common formats
+        resume_files = []
+        current_dir = Path(".")
         
-        logger.info(f"Received MCP request: {message.method}")
+        # Search for resume files
+        for pattern in ["resume.*", "cv.*", "Resume.*", "CV.*"]:
+            resume_files.extend(current_dir.glob(pattern))
         
-        if message.method == "tools/list":
-            result = await MCPTools.list_tools()
-            return MCPMessage(
-                id=message.id,
-                result=result
-            )
+        if not resume_files:
+            return "# Resume\n\nNo resume file found. Please place your resume file in the current directory with a name like 'resume.pdf', 'resume.docx', 'resume.txt', or 'resume.md'."
         
-        elif message.method == "tools/call":
-            if not message.params:
-                raise HTTPException(status_code=400, detail="Missing parameters")
-            
-            tool_name = message.params.get("name")
-            arguments = message.params.get("arguments", {})
-            
-            result = await MCPTools.call_tool(tool_name, arguments)
-            return MCPMessage(
-                id=message.id,
-                result=result
-            )
+        # Use the first resume file found
+        resume_file = resume_files[0]
         
-        elif message.method == "initialize":
-            result = {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {
-                    "tools": {}
-                },
-                "serverInfo": {
-                    "name": "puch-mcp-server",
-                    "version": "1.0.0"
-                }
-            }
-            return MCPMessage(
-                id=message.id,
-                result=result
-            )
+        if resume_file.suffix.lower() == '.txt':
+            # Read plain text file
+            with open(resume_file, 'r', encoding='utf-8') as f:
+                content = f.read()
+            return content
+        
+        elif resume_file.suffix.lower() == '.md':
+            # Read markdown file
+            with open(resume_file, 'r', encoding='utf-8') as f:
+                content = f.read()
+            return content
+        
+        elif resume_file.suffix.lower() == '.pdf':
+            # Read PDF file
+            try:
+                with open(resume_file, 'rb') as f:
+                    pdf_reader = PyPDF2.PdfReader(f)
+                    text = ""
+                    for page in pdf_reader.pages:
+                        text += page.extract_text() + "\n"
+                return f"# Resume\n\n{text.strip()}"
+            except Exception as e:
+                return f"# Resume\n\nError reading PDF file: {str(e)}\n\nPlease ensure the PDF is not password protected."
+        
+        elif resume_file.suffix.lower() in ['.docx', '.doc']:
+            # Read Word document
+            try:
+                doc = Document(resume_file)
+                text = ""
+                for paragraph in doc.paragraphs:
+                    text += paragraph.text + "\n"
+                return f"# Resume\n\n{text.strip()}"
+            except Exception as e:
+                return f"# Resume\n\nError reading Word document: {str(e)}"
         
         else:
-            raise HTTPException(status_code=400, detail=f"Unknown method: {message.method}")
+            return f"# Resume\n\nUnsupported file format: {resume_file.suffix}\n\nSupported formats: .txt, .md, .pdf, .docx"
+            
+    except Exception as e:
+        return f"# Resume\n\nError reading resume file: {str(e)}\n\nPlease ensure your resume file is accessible and in a supported format."
+
+@mcp.tool
+async def validate() -> str:
+    """
+    NOTE: This tool must be present in an MCP server used by puch.
+    """
+    return MY_NUMBER
+
+FetchToolDescription = RichToolDescription(
+    description="Fetch a URL and return its content.",
+    use_when="Use this tool when the user provides a URL and asks for its content, or when the user wants to fetch a webpage.",
+    side_effects="The user will receive the content of the requested URL in a simplified format, or raw HTML if requested.",
+)
+
+@mcp.tool(description=FetchToolDescription.model_dump_json())
+async def fetch(
+    url: Annotated[AnyUrl, Field(description="URL to fetch")],
+    max_length: Annotated[
+        int,
+        Field(
+            default=5000,
+            description="Maximum number of characters to return.",
+            gt=0,
+            lt=1000000,
+        ),
+    ] = 5000,
+    start_index: Annotated[
+        int,
+        Field(
+            default=0,
+            description="On return output starting at this character index, useful if a previous fetch was truncated and more context is required.",
+            ge=0,
+        ),
+    ] = 0,
+    raw: Annotated[
+        bool,
+        Field(
+            default=False,
+            description="Get the actual HTML content if the requested page, without simplification.",
+        ),
+    ] = False,
+) -> list[TextContent]:
+    """Fetch a URL and return its content."""
+    url_str = str(url).strip()
+    if not url:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message="URL is required"))
+
+    content, prefix = await Fetch.fetch_url(url_str, Fetch.USER_AGENT, force_raw=raw)
+    original_length = len(content)
     
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-    except Exception as e:
-        logger.error(f"MCP handler error: {e}")
-        return MCPMessage(
-            id=getattr(message, 'id', None),
-            error={
-                "code": -32603,
-                "message": str(e)
-            }
-        )
-
-# MCP endpoint
-@app.post("/mcp")
-async def handle_mcp_request(message: MCPMessage, token: str = Depends(verify_token)):
-    try:
-        if message.method == "initialize":
-            return MCPMessage(
-                jsonrpc="2.0",
-                id=message.id,
-                result={
-                    "protocolVersion": "0.1",
-                    "serverInfo": {
-                        "name": "Puch MCP Server",
-                        "version": "1.0.0",
-                        "vendor": "Custom"
-                    },
-                    "capabilities": {
-                        "execute": True,
-                        "tokenize": False,
-                        "chat": False,
-                        "embeddings": False,
-                        "tools": {
-                            "resume": {
-                                "description": "Reads and processes resume files in various formats"
-                            },
-                            "fetch_webpage": {
-                                "description": "Fetches and processes web content"
-                            }
-                        }
-                    }
-                }
-            )
-        
-        elif message.method == "execute":
-            if not message.params or "tool" not in message.params:
-                raise ValueError("Tool parameter is required")
-            
-            tool = message.params["tool"]
-            arguments = message.params.get("arguments", {})
-            
-            if tool == "resume":
-                content = ResumeProcessor.get_resume_content()
-                return MCPMessage(
-                    jsonrpc="2.0",
-                    id=message.id,
-                    result={"content": content}
-                )
-            
-            elif tool == "fetch_webpage":
-                if "url" not in arguments:
-                    raise ValueError("URL parameter is required")
-                
-                content, content_type = await WebFetcher.fetch_url(arguments["url"])
-                return MCPMessage(
-                    jsonrpc="2.0",
-                    id=message.id,
-                    result={
-                        "content": content,
-                        "content_type": content_type
-                    }
-                )
-            
-            else:
-                raise ValueError(f"Unknown tool: {tool}")
-        
+    if start_index >= original_length:
+        content = "<e>No more content available.</e>"
+    else:
+        truncated_content = content[start_index : start_index + max_length]
+        if not truncated_content:
+            content = "<e>No more content available.</e>"
         else:
-            raise ValueError(f"Unsupported method: {message.method}")
+            content = truncated_content
+            actual_content_length = len(truncated_content)
+            remaining_content = original_length - (start_index + actual_content_length)
             
-    except Exception as e:
-        logger.error(f"Error processing MCP request: {e}")
-        return MCPMessage(
-            jsonrpc="2.0",
-            id=message.id,
-            error={
-                "code": -32000,
-                "message": str(e)
-            }
-        )
+            # Only add the prompt to continue fetching if there is still remaining content
+            if actual_content_length == max_length and remaining_content > 0:
+                next_start = start_index + actual_content_length
+                content += f"\n\n<e>Content truncated. Call the fetch tool with a start_index of {next_start} to get more content.</e>"
 
-# Simple tool endpoints for testing
-@app.get("/test/resume")
-async def test_resume():
-    """Test endpoint for resume tool."""
-    content = ResumeProcessor.get_resume_content()
-    return {"resume": content}
+    return [TextContent(type="text", text=f"{prefix}Contents of {url}:\n{content}")]
 
-@app.get("/test/validate")
-async def test_validate():
-    """Test endpoint for validate tool."""
-    return {"phone_number": MY_NUMBER}
+async def main():
+    print(f"Starting MCP server on http://0.0.0.0:8085")
+    print(f"Auth token: {TOKEN}")
+    print(f"Phone number: {MY_NUMBER}")
+    await mcp.run_async(
+        "streamable-http",
+        host="0.0.0.0",
+        port=8085,
+    )
 
 if __name__ == "__main__":
-    logger.info("Starting Puch MCP HTTP Server...")
-    logger.info(f"Validation number: {MY_NUMBER}")
-    logger.info(f"Token configured: {'Yes' if TOKEN != 'YOUR_APPLICATION_KEY_HERE' else 'No - PLEASE UPDATE TOKEN'}")
-    
-    # Check if resume file exists
-    resume_files = ["resume.pdf", "resume.docx", "resume.txt", "cv.pdf", "cv.docx", "cv.txt"]
-    found_resume = any(os.path.exists(f) for f in resume_files)
-    if found_resume:
-        logger.info("Resume file found and ready")
-    else:
-        logger.warning("No resume file found. Please add one of: " + ", ".join(resume_files))
-    
-    uvicorn.run(app, host="0.0.0.0", port=8085)
+    asyncio.run(main())
